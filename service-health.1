@@ -1,0 +1,198 @@
+.\" Manpage for service-health.
+.\" Contact pfurpass@gmail.com to correct errors or typos.
+.TH SERVICE-HEALTH 1 "2026-06-04" "service-health 1.0.0" "User Commands"
+.SH NAME
+service\-health \- monitor systemd service health status
+.SH SYNOPSIS
+.B service\-health
+.RI [ OPTIONS ]
+.RI [ SERVICE ...]
+.SH DESCRIPTION
+.B service\-health
+is a command\-line tool for monitoring the health of
+.BR systemd (1)
+services. With no arguments it prints a colored table of all services
+showing their status, uptime, memory usage, CPU usage, restart count and
+boot\-enable state. Given one or more
+.I SERVICE
+names, it restricts the output to those services.
+.PP
+The tool is designed to be dependency\-light (bash, systemd and coreutils
+only), to work without an internet connection, and to degrade gracefully
+when run without root privileges. Some figures (for example exact memory
+accounting) may only be available to the superuser; missing values are shown
+as a dash
+.RB ( \- ).
+.SH OPTIONS
+.TP
+.B (no option)
+Show all services in a table.
+.TP
+.I SERVICE ...
+Show only the named services. A bare name such as
+.I nginx
+is treated as
+.IR nginx.service .
+.TP
+.BR \-\-detailed " [" \fISERVICE\fR ]
+Show a detailed view (description, PID, uptime, memory, CPU, restarts,
+process tree and, for failed units, the last error). With no argument the
+detailed view is produced for every service.
+.TP
+.B \-\-alerts
+Show only services with problems or warnings (failed units, or running units
+that exceed the configured CPU, memory or restart thresholds).
+.TP
+.B \-\-failed
+Show only failed services together with their last error message.
+.TP
+.B \-\-json
+Produce machine\-readable JSON. Each object contains the fields
+.IR name ", " status ", " uptime_seconds ", " memory_mb ", " cpu_percent ", "
+.IR restart_count_24h ", " enabled_on_boot " and " last_error .
+Unavailable numeric values are rendered as
+.BR null .
+.TP
+.B \-\-no\-colors
+Disable ANSI colors. Colors are also disabled automatically when standard
+output is not a terminal, when the
+.B NO_COLOR
+environment variable is set, or when
+.B USE_COLORS=no
+is configured.
+.TP
+.BR \-\-watch " [" \-\-interval " \fIN\fR]"
+Live monitoring mode: refresh the table every
+.I N
+seconds (default 2). Exit with Ctrl+C.
+.TP
+.I SERVICE
+.BR \-\-history " [" \-\-days " \fIN\fR]"
+Show the restart and state\-change history for
+.I SERVICE
+over the last
+.I N
+days (default 7), derived from the journal.
+.TP
+.I SERVICE
+.BR \-\-logs " [" \-\-lines " \fIN\fR] [" \-\-follow ]
+Show the last
+.I N
+journal entries (default 10) for
+.IR SERVICE .
+With
+.B \-\-follow
+the output is tailed continuously, like
+.BR "journalctl \-f" .
+.TP
+.I SERVICE
+.B \-\-dependencies
+Show what
+.I SERVICE
+requires, wants and is ordered against, plus the units that depend on it.
+Failed hard dependencies are highlighted.
+.TP
+.BI \-\-config " FILE"
+Load an alternative configuration file instead of
+.IR /etc/service\-health/config.conf .
+.TP
+.B \-\-verbose
+Print debugging information (such as the commands executed) to standard error.
+.TP
+.B \-\-version
+Print the version and exit.
+.TP
+.B \-\-help
+Print a usage summary and exit.
+.SH EXAMPLES
+.TP
+.B service\-health
+Show all services.
+.TP
+.B service\-health nginx postgresql
+Show only nginx and postgresql.
+.TP
+.B service\-health \-\-alerts
+List only services that need attention.
+.TP
+.B service\-health \-\-json \-\-no\-colors
+Emit JSON suitable for piping into another tool.
+.TP
+.B service\-health nginx \-\-logs \-\-lines 50
+Show the last 50 journal lines for nginx.
+.TP
+.B service\-health mysql \-\-dependencies
+Show the dependency graph around mysql.
+.SH CONFIGURATION
+On start\-up
+.B service\-health
+sources
+.I /etc/service\-health/config.conf
+if it exists and is readable. The file is a shell fragment that may set the
+following variables:
+.TP
+.B IGNORE_SERVICES
+Comma\- or whitespace\-separated list of service names to omit from output.
+.TP
+.B CPU_ALERT_THRESHOLD
+CPU percentage above which a running service is flagged as a warning
+(default 50).
+.TP
+.B MEMORY_ALERT_THRESHOLD
+Memory in MB above which a running service is flagged as a warning
+(default 1000).
+.TP
+.B RESTART_ALERT_THRESHOLD
+Restart count above which a running service is flagged as a warning
+(default 5).
+.TP
+.B USE_COLORS
+Set to
+.B no
+to disable colored output by default.
+.TP
+.B DEFAULT_FORMAT
+Default output format:
+.IR table ", " json " or " detailed .
+.TP
+.B WATCH_INTERVAL
+Default refresh interval for
+.B \-\-watch
+in seconds.
+.SH "EXIT STATUS"
+.TP
+.B 0
+Success (this includes the case of no services found).
+.TP
+.B 1
+A requested service was not found, or systemd is unavailable.
+.TP
+.B 2
+Invalid command\-line usage.
+.SH NOTES
+The CPU percentage is the average over the lifetime of the process, as
+reported by
+.BR ps (1),
+not an instantaneous sample. The restart count shown in the table is the
+.B NRestarts
+counter maintained by systemd since the unit was loaded; use
+.B \-\-history
+for a journal\-based view of restarts within a time window.
+.SH FILES
+.TP
+.I /etc/service\-health/config.conf
+Optional system\-wide configuration file.
+.SH "SEE ALSO"
+.BR systemctl (1),
+.BR journalctl (1),
+.BR systemd (1),
+.BR ps (1)
+.SH AUTHOR
+Phillip Fürpaß <pfurpass@gmail.com>
+.SH COPYRIGHT
+Copyright \(co 2026 Phillip Fürpaß.
+License GPLv3+: GNU GPL version 3 or later
+<https://gnu.org/licenses/gpl.html>.
+.br
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.

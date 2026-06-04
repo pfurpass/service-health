@@ -1,0 +1,726 @@
+#!/bin/bash
+#
+# service-health - Monitor systemd service health status
+#
+# A dependency-light command-line tool that summarises the health of
+# systemd services: status, uptime, memory, CPU, restarts and boot state.
+#
+# Copyright (C) 2024 Your Name <your.email@example.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version. See <https://www.gnu.org/licenses/>.
+#
+# ---------------------------------------------------------------------------
+# Note on shell options:
+#   We deliberately enable `pipefail` but NOT `errexit` (set -e). A monitoring
+#   tool runs many commands that legitimately return non-zero in normal
+#   operation (e.g. `systemctl is-enabled` returns 1 for a disabled unit,
+#   `grep -c` returns 1 on zero matches, `journalctl` may be unreadable as
+#   non-root). With `errexit` those would abort the whole program. Instead we
+#   handle each external command explicitly. See README for the rationale.
+# ---------------------------------------------------------------------------
+
+set -o pipefail
+
+VERSION="1.0.0"
+PROGNAME="service-health"
+
+# ---------------------------------------------------------------------------
+# Defaults (can be overridden by the config file, see load_config)
+# ---------------------------------------------------------------------------
+CONFIG_FILE="${SERVICE_HEALTH_CONFIG:-/etc/service-health/config.conf}"
+IGNORE_SERVICES=""
+CPU_ALERT_THRESHOLD=50          # percent
+MEMORY_ALERT_THRESHOLD=1000     # MB
+RESTART_ALERT_THRESHOLD=5       # restarts
+USE_COLORS="yes"
+DEFAULT_FORMAT="table"          # table|json|detailed
+WATCH_INTERVAL=2                # seconds
+
+# Runtime flags
+VERBOSE=0
+NO_COLORS_FLAG=0
+FOLLOW=0
+LOG_LINES=10
+HISTORY_DAYS=7
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+err()  { printf '%s: %s\n' "$PROGNAME" "$*" >&2; }
+vlog() { (( VERBOSE )) && printf '[verbose] %s\n' "$*" >&2; return 0; }
+
+# ---------------------------------------------------------------------------
+# Pre-flight: systemd present?
+# ---------------------------------------------------------------------------
+require_systemd() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        err "Error: systemd not found (systemctl missing)"
+        exit 1
+    fi
+    if ! systemctl list-units --type=service --no-pager >/dev/null 2>&1; then
+        err "Error: cannot talk to systemd (is the system booted with systemd?)"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Config file (sourced if readable; it is an admin-owned shell fragment)
+# ---------------------------------------------------------------------------
+load_config() {
+    local file="$1"
+    if [[ -r "$file" ]]; then
+        vlog "loading config: $file"
+        # shellcheck disable=SC1090
+        . "$file"
+    elif [[ -n "${EXPLICIT_CONFIG:-}" ]]; then
+        err "Error: config file not readable: $file"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Colors. Respect NO_COLOR (https://no-color.org), USE_COLORS, --no-colors
+# and only colorize when stdout is a terminal.
+# ---------------------------------------------------------------------------
+setup_colors() {
+    if [[ -n "${NO_COLOR:-}" ]] || [[ "$USE_COLORS" == "no" ]] \
+       || (( NO_COLORS_FLAG )) || [[ ! -t 1 ]]; then
+        C_RESET="" C_GREEN="" C_YELLOW="" C_RED="" C_GRAY="" C_BOLD="" C_DIM=""
+    else
+        C_RESET=$'\033[0m'
+        C_GREEN=$'\033[32m'
+        C_YELLOW=$'\033[33m'
+        C_RED=$'\033[31m'
+        C_GRAY=$'\033[90m'
+        C_BOLD=$'\033[1m'
+        C_DIM=$'\033[2m'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+# format_uptime SECONDS  ->  "45d 12h 3m" / "2h 30m" / "30s" / "-"
+format_uptime() {
+    local s=$1
+    if [[ ! "$s" =~ ^[0-9]+$ ]]; then printf '%s' "-"; return; fi
+    local d=$(( s / 86400 ))
+    local h=$(( (s % 86400) / 3600 ))
+    local m=$(( (s % 3600) / 60 ))
+    local sec=$(( s % 60 ))
+    if   (( d > 0 )); then printf '%dd %dh %dm' "$d" "$h" "$m"
+    elif (( h > 0 )); then printf '%dh %dm' "$h" "$m"
+    elif (( m > 0 )); then printf '%dm %ds' "$m" "$sec"
+    else                   printf '%ds' "$sec"
+    fi
+}
+
+# format_memory BYTES  ->  "45.2MB" / "1.5GB" / "-"
+format_memory() {
+    local b=$1
+    if [[ ! "$b" =~ ^[0-9]+$ ]]; then printf '%s' "-"; return; fi
+    awk -v b="$b" 'BEGIN{
+        mb = b / 1048576.0
+        if (mb >= 1024) printf "%.1fGB", mb/1024
+        else            printf "%.1fMB", mb
+    }'
+}
+
+# json_escape STRING -> escaped string for JSON
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    printf '%s' "$s"
+}
+
+# Truncate a (mostly ASCII) string to N characters, hard cut.
+trunc() { local s="$1" n="$2"; printf '%s' "${s:0:n}"; }
+
+# ---------------------------------------------------------------------------
+# Per-PID CPU and RSS maps (single `ps` call, much faster than per service).
+# Note: ps %CPU is the average over the process lifetime, not instantaneous.
+# ---------------------------------------------------------------------------
+declare -A CPU_BY_PID
+declare -A RSS_BY_PID
+build_proc_maps() {
+    CPU_BY_PID=()
+    RSS_BY_PID=()
+    local pid cpu rss
+    while read -r pid cpu rss; do
+        [[ -z "$pid" ]] && continue
+        CPU_BY_PID["$pid"]="$cpu"
+        RSS_BY_PID["$pid"]="$rss"   # kB
+    done < <(ps -eo pid=,%cpu=,rss= 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# Service discovery
+# ---------------------------------------------------------------------------
+
+# Returns all loaded service unit names, applying the IGNORE_SERVICES filter.
+get_all_services() {
+    local name
+    # Build an ignore lookup (comma- or whitespace-separated, names may omit .service)
+    local -A ignore=()
+    local item
+    for item in ${IGNORE_SERVICES//,/ }; do
+        [[ -z "$item" ]] && continue
+        ignore["${item%.service}"]=1
+    done
+    while read -r name _; do
+        [[ "$name" == *.service ]] || continue
+        [[ -n "${ignore[${name%.service}]:-}" ]] && continue
+        printf '%s\n' "$name"
+    done < <(systemctl list-units --type=service --all --no-legend --no-pager --plain 2>/dev/null)
+}
+
+# Normalise a user-supplied service name (add .service if no unit suffix).
+normalise_name() {
+    local n="$1"
+    if [[ "$n" == *.* ]]; then printf '%s' "$n"; else printf '%s.service' "$n"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Bulk property fetch. One `systemctl show` call for ALL units. Emits a
+# tab-separated record per unit, description last (descriptions never contain
+# tabs). Records are split on blank lines by systemctl.
+# ---------------------------------------------------------------------------
+show_properties() {
+    local props="Id,LoadState,ActiveState,SubState,MainPID,MemoryCurrent,NRestarts,UnitFileState,ExecMainStartTimestamp,Description"
+    vlog "systemctl show ${#@} unit(s) --property=$props"
+    systemctl show "$@" --property="$props" --no-pager 2>/dev/null | awk '
+        BEGIN { RS=""; FS="\n" }
+        {
+            for (k in p) delete p[k]
+            for (i = 1; i <= NF; i++) {
+                e = index($i, "=")
+                if (e > 0) { key = substr($i, 1, e-1); p[key] = substr($i, e+1) }
+            }
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                p["Id"], p["LoadState"], p["ActiveState"], p["SubState"],
+                p["MainPID"], p["MemoryCurrent"], p["NRestarts"],
+                p["UnitFileState"], p["ExecMainStartTimestamp"], p["Description"]
+        }'
+}
+
+# ---------------------------------------------------------------------------
+# Collection. Fills the global COLLECTED array. Each element is a
+# tab-separated computed record:
+#   name <TAB> category <TAB> uptime_s <TAB> mem_bytes <TAB> cpu <TAB>
+#   restarts <TAB> enabled_display <TAB> enabled_bool <TAB> active <TAB> sub
+# category is one of: running warning failed inactive other
+# uptime_s / mem_bytes are -1 when unavailable; cpu is "-" when unavailable.
+# ---------------------------------------------------------------------------
+declare -a COLLECTED
+collect() {
+    COLLECTED=()
+    build_proc_maps
+    local now; now=$(date +%s)
+
+    local -a units=("$@")
+    if (( ${#units[@]} == 0 )); then
+        mapfile -t units < <(get_all_services)
+    fi
+    if (( ${#units[@]} == 0 )); then
+        return 0
+    fi
+
+    local id load active sub pid mem nrestarts uf startts desc
+    while IFS=$'\t' read -r id load active sub pid mem nrestarts uf startts desc; do
+        [[ -z "$id" ]] && continue
+
+        # Validate explicitly named units.
+        if [[ "$load" == "not-found" ]]; then
+            err "Error: service '${id%.service}' not found"
+            EXIT_CODE=1
+            continue
+        fi
+
+        # Uptime
+        local uptime_s=-1 st=""
+        if [[ "$active" == "active" && -n "$startts" && "$startts" != "n/a" ]]; then
+            st=$(date -d "$startts" +%s 2>/dev/null) || st=""
+            [[ -n "$st" ]] && uptime_s=$(( now - st ))
+            (( uptime_s < 0 )) && uptime_s=-1
+        fi
+
+        # Memory: prefer cgroup value, fall back to RSS from ps.
+        local mem_bytes=-1
+        if [[ "$mem" =~ ^[0-9]+$ && "$mem" != "18446744073709551615" ]]; then
+            mem_bytes=$mem
+        elif [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) && [[ -n "${RSS_BY_PID[$pid]:-}" ]]; then
+            mem_bytes=$(( ${RSS_BY_PID[$pid]} * 1024 ))
+        fi
+
+        # CPU
+        local cpu="-"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) && [[ -n "${CPU_BY_PID[$pid]:-}" ]]; then
+            cpu="${CPU_BY_PID[$pid]}"
+        fi
+
+        # Restart count
+        local restarts=0
+        [[ "$nrestarts" =~ ^[0-9]+$ ]] && restarts=$nrestarts
+
+        # Enabled on boot
+        local en_disp en_bool
+        case "$uf" in
+            enabled|enabled-runtime) en_disp="yes"; en_bool="true" ;;
+            disabled)                en_disp="no";  en_bool="false" ;;
+            "")                      en_disp="-";   en_bool="false" ;;
+            *)                       en_disp="$uf"; en_bool="false" ;;  # static, indirect, ...
+        esac
+
+        # Category / health
+        local mem_mb=0
+        if (( mem_bytes >= 0 )); then
+            mem_mb=$(awk -v b="$mem_bytes" 'BEGIN{printf "%d", b/1048576}')
+        fi
+        local category
+        case "$active" in
+            active)
+                category="running"
+                local warn=0
+                if [[ "$cpu" != "-" ]] && awk -v c="$cpu" -v t="$CPU_ALERT_THRESHOLD" \
+                        'BEGIN{exit !(c+0 > t+0)}'; then warn=1; fi
+                (( mem_mb   > MEMORY_ALERT_THRESHOLD  )) && warn=1
+                (( restarts > RESTART_ALERT_THRESHOLD )) && warn=1
+                (( warn )) && category="warning"
+                ;;
+            failed)                          category="failed" ;;
+            inactive)                        category="inactive" ;;
+            activating|deactivating|reloading) category="warning" ;;
+            *)                               category="other" ;;
+        esac
+
+        COLLECTED+=( "$id"$'\t'"$category"$'\t'"$uptime_s"$'\t'"$mem_bytes"$'\t'"$cpu"$'\t'"$restarts"$'\t'"$en_disp"$'\t'"$en_bool"$'\t'"$active"$'\t'"$sub" )
+    done < <(show_properties "${units[@]}")
+}
+
+# ---------------------------------------------------------------------------
+# Status cell with correct visible-width padding. Emoji are counted as 2
+# display columns (icon) + 1 space + the status word.
+# ---------------------------------------------------------------------------
+STATUSW=11
+status_cell() {
+    local category="$1"
+    local icon text color
+    case "$category" in
+        running)  icon="✅"; text="running";  color="$C_GREEN"  ;;
+        warning)  icon="⚠️"; text="warning";  color="$C_YELLOW" ;;
+        failed)   icon="❌"; text="failed";   color="$C_RED"    ;;
+        inactive) icon="⏸️"; text="inactive"; color="$C_GRAY"   ;;
+        *)        icon="❔"; text="unknown";  color="$C_GRAY"   ;;
+    esac
+    local visible=$(( 2 + 1 + ${#text} ))      # icon(2) + space + word
+    local pad=$(( STATUSW - visible ))
+    (( pad < 0 )) && pad=0
+    printf '%s%s %s%s%*s' "$color" "$icon" "$text" "$C_RESET" "$pad" ""
+}
+
+# ---------------------------------------------------------------------------
+# Table output
+# ---------------------------------------------------------------------------
+NAMEW=26; UPTIMEW=14; MEMW=10; CPUW=7; RESTW=9; ENW=8
+
+table_header() {
+    printf '%s%-*s %-*s %-*s %-*s %-*s %-*s %-*s%s\n' "$C_BOLD" \
+        "$NAMEW"   "SERVICE" \
+        "$STATUSW" "STATUS" \
+        "$UPTIMEW" "UPTIME" \
+        "$MEMW"    "MEMORY" \
+        "$CPUW"    "CPU" \
+        "$RESTW"   "RESTARTS" \
+        "$ENW"     "ENABLED" "$C_RESET"
+    local total=$(( NAMEW + 1 + STATUSW + 1 + UPTIMEW + 1 + MEMW + 1 + CPUW + 1 + RESTW + 1 + ENW ))
+    printf '%s%*s%s\n' "$C_DIM" "$total" "" "$C_RESET" | tr ' ' '-'
+}
+
+# Print one collected record as a table row.
+table_row() {
+    local name="$1" category="$2" uptime_s="$3" mem_bytes="$4" cpu="$5" \
+          restarts="$6" en_disp="$7"
+    local disp_name; disp_name=$(trunc "${name%.service}" "$NAMEW")
+    local up_disp;   up_disp=$(format_uptime "$uptime_s")
+    local mem_disp;  mem_disp=$(format_memory "$mem_bytes")
+    local cpu_disp="-"
+    [[ "$cpu" != "-" ]] && cpu_disp=$(awk -v c="$cpu" 'BEGIN{printf "%.1f%%", c}')
+
+    printf '%-*s ' "$NAMEW" "$disp_name"
+    status_cell "$category"
+    printf ' '
+    printf '%-*s %-*s %-*s %-*s %-*s\n' \
+        "$UPTIMEW" "$up_disp" \
+        "$MEMW"    "$mem_disp" \
+        "$CPUW"    "$cpu_disp" \
+        "$RESTW"   "$restarts" \
+        "$ENW"     "$en_disp"
+}
+
+# Render COLLECTED as a table. Optional arg = filter category set (regex).
+format_table() {
+    local filter="${1:-}"
+    if (( ${#COLLECTED[@]} == 0 )); then
+        printf 'No services found\n'
+        return 0
+    fi
+    table_header
+    local rec name category rest
+    local shown=0
+    for rec in "${COLLECTED[@]}"; do
+        IFS=$'\t' read -r name category uptime_s mem_bytes cpu restarts en_disp en_bool active sub <<<"$rec"
+        if [[ -n "$filter" && ! "$category" =~ $filter ]]; then continue; fi
+        table_row "$name" "$category" "$uptime_s" "$mem_bytes" "$cpu" "$restarts" "$en_disp"
+        shown=1
+    done
+    (( shown )) || printf '%s(none)%s\n' "$C_DIM" "$C_RESET"
+}
+
+# ---------------------------------------------------------------------------
+# JSON output
+# ---------------------------------------------------------------------------
+format_json() {
+    local rec name category uptime_s mem_bytes cpu restarts en_disp en_bool active sub
+    local first=1
+    printf '[\n'
+    for rec in "${COLLECTED[@]}"; do
+        IFS=$'\t' read -r name category uptime_s mem_bytes cpu restarts en_disp en_bool active sub <<<"$rec"
+        (( first )) || printf ',\n'
+        first=0
+
+        local uptime_json="null"
+        [[ "$uptime_s" =~ ^[0-9]+$ ]] && uptime_json="$uptime_s"
+        local mem_json="null"
+        [[ "$mem_bytes" =~ ^[0-9]+$ ]] && mem_json=$(awk -v b="$mem_bytes" 'BEGIN{printf "%.1f", b/1048576}')
+        local cpu_json="null"
+        [[ "$cpu" != "-" ]] && cpu_json=$(awk -v c="$cpu" 'BEGIN{printf "%.1f", c}')
+
+        # last_error only for failed services (keeps the common path fast).
+        local last_error_json="null"
+        if [[ "$category" == "failed" ]]; then
+            local le; le=$(get_last_error "$name")
+            [[ -n "$le" ]] && last_error_json="\"$(json_escape "$le")\""
+        fi
+
+        printf '  {\n'
+        printf '    "name": "%s",\n'              "$(json_escape "${name%.service}")"
+        printf '    "status": "%s",\n'            "$active"
+        printf '    "uptime_seconds": %s,\n'      "$uptime_json"
+        printf '    "memory_mb": %s,\n'           "$mem_json"
+        printf '    "cpu_percent": %s,\n'         "$cpu_json"
+        printf '    "restart_count_24h": %s,\n'   "$restarts"
+        printf '    "enabled_on_boot": %s,\n'     "$en_bool"
+        printf '    "last_error": %s\n'           "$last_error_json"
+        printf '  }'
+    done
+    printf '\n]\n'
+}
+
+# ---------------------------------------------------------------------------
+# journalctl-backed helpers
+# ---------------------------------------------------------------------------
+get_last_error() {
+    local svc="$1"
+    timeout 5 journalctl -u "$svc" -p err -n 1 --no-pager -o cat 2>/dev/null | tail -n1
+}
+
+show_logs() {
+    local svc="$1"
+    if (( FOLLOW )); then
+        vlog "journalctl -u $svc -n $LOG_LINES -f"
+        journalctl -u "$svc" -n "$LOG_LINES" --no-pager -f
+    else
+        vlog "journalctl -u $svc -n $LOG_LINES"
+        journalctl -u "$svc" -n "$LOG_LINES" --no-pager || {
+            err "could not read journal for '$svc' (try sudo)"; return 1; }
+    fi
+}
+
+show_history() {
+    local svc="$1"
+    printf '%sRestart / state history for %s (last %d days)%s\n\n' \
+        "$C_BOLD" "${svc%.service}" "$HISTORY_DAYS" "$C_RESET"
+    timeout 10 journalctl -u "$svc" --since "${HISTORY_DAYS} days ago" \
+        --no-pager -o short-iso 2>/dev/null \
+        | grep -Ei 'started|stopped|deactivated|failed|main process exited|scheduled restart' \
+        || printf '%sNo state changes recorded (or journal unreadable; try sudo).%s\n' "$C_DIM" "$C_RESET"
+}
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+show_dependencies() {
+    local svc="$1"
+    local wants requires after before
+    wants=$(systemctl show "$svc" --property=Wants --value 2>/dev/null)
+    requires=$(systemctl show "$svc" --property=Requires --value 2>/dev/null)
+    after=$(systemctl show "$svc" --property=After --value 2>/dev/null)
+    before=$(systemctl show "$svc" --property=Before --value 2>/dev/null)
+
+    printf '%sDependencies of %s%s\n\n' "$C_BOLD" "${svc%.service}" "$C_RESET"
+    printf '%sRequires:%s %s\n' "$C_BOLD" "$C_RESET" "${requires:-(none)}"
+    printf '%sWants:%s    %s\n' "$C_BOLD" "$C_RESET" "${wants:-(none)}"
+    printf '%sAfter:%s    %s\n' "$C_BOLD" "$C_RESET" "${after:-(none)}"
+    printf '%sBefore:%s   %s\n' "$C_BOLD" "$C_RESET" "${before:-(none)}"
+
+    # Highlight failed hard dependencies.
+    local dep state
+    for dep in $requires $wants; do
+        [[ "$dep" == *.service ]] || continue
+        state=$(systemctl show "$dep" --property=ActiveState --value 2>/dev/null)
+        if [[ "$state" == "failed" ]]; then
+            printf '%s  ⚠ dependency %s is FAILED but %s needs it!%s\n' \
+                "$C_RED" "${dep%.service}" "${svc%.service}" "$C_RESET"
+        fi
+    done
+
+    printf '\n%sUnits that depend on %s:%s\n' "$C_BOLD" "${svc%.service}" "$C_RESET"
+    systemctl list-dependencies --reverse --no-pager "$svc" 2>/dev/null | tail -n +2 \
+        || printf '%s(unable to determine)%s\n' "$C_DIM" "$C_RESET"
+}
+
+# ---------------------------------------------------------------------------
+# Detailed view
+# ---------------------------------------------------------------------------
+format_detailed() {
+    local -a units=("$@")
+    if (( ${#units[@]} == 0 )); then
+        mapfile -t units < <(get_all_services)
+    fi
+    build_proc_maps
+    local now; now=$(date +%s)
+    local svc id load active sub pid mem nrestarts uf startts desc
+    local first=1
+    for svc in "${units[@]}"; do
+        IFS=$'\t' read -r id load active sub pid mem nrestarts uf startts desc \
+            < <(show_properties "$svc")
+        if [[ "$load" == "not-found" || -z "$id" ]]; then
+            err "Error: service '${svc%.service}' not found"; EXIT_CODE=1; continue
+        fi
+        (( first )) || printf '\n'
+        first=0
+
+        local uptime_s=-1 st=""
+        if [[ "$active" == "active" && -n "$startts" && "$startts" != "n/a" ]]; then
+            st=$(date -d "$startts" +%s 2>/dev/null) || st=""
+            [[ -n "$st" ]] && uptime_s=$(( now - st ))
+        fi
+        local mem_bytes=-1
+        [[ "$mem" =~ ^[0-9]+$ && "$mem" != "18446744073709551615" ]] && mem_bytes=$mem
+        local cpu="-"
+        [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) && cpu="${CPU_BY_PID[$pid]:--}"
+
+        printf '%s%s%s\n' "$C_BOLD" "${id%.service}" "$C_RESET"
+        printf '  Description : %s\n' "${desc:-(none)}"
+        printf '  Load/Active : %s / %s (%s)\n' "$load" "$active" "$sub"
+        printf '  Main PID    : %s\n' "${pid:-0}"
+        printf '  Uptime      : %s\n' "$(format_uptime "$uptime_s")"
+        printf '  Started     : %s\n' "${startts:-(n/a)}"
+        printf '  Memory      : %s\n' "$(format_memory "$mem_bytes")"
+        local cpu_disp="-"
+        [[ "$cpu" != "-" ]] && cpu_disp=$(awk -v c="$cpu" 'BEGIN{printf "%.1f%%", c}')
+        printf '  CPU         : %s\n' "$cpu_disp"
+        printf '  Restarts    : %s\n' "${nrestarts:-0}"
+        printf '  Enabled     : %s\n' "${uf:-(unknown)}"
+
+        if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); then
+            printf '  Process tree:\n'
+            ps --no-headers -o pid,ppid,cmd --ppid "$pid" -p "$pid" 2>/dev/null \
+                | sed 's/^/    /' || true
+        fi
+        if [[ "$active" == "failed" ]]; then
+            local le; le=$(get_last_error "$id")
+            [[ -n "$le" ]] && printf '  %sLast error  : %s%s\n' "$C_RED" "$le" "$C_RESET"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Watch mode
+# ---------------------------------------------------------------------------
+watch_services() {
+    local -a units=("$@")
+    trap 'printf "\n"; exit 0' INT TERM
+    while true; do
+        clear 2>/dev/null || printf '\033[H\033[2J'
+        printf '%sservice-health%s  %s  (every %ss, Ctrl+C to exit)\n\n' \
+            "$C_BOLD" "$C_RESET" "$(date '+%Y-%m-%d %H:%M:%S')" "$WATCH_INTERVAL"
+        collect "${units[@]}"
+        format_table
+        sleep "$WATCH_INTERVAL" || break
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Help / version
+# ---------------------------------------------------------------------------
+print_version() { printf '%s %s\n' "$PROGNAME" "$VERSION"; }
+
+print_help() {
+    cat <<EOF
+$PROGNAME $VERSION - Monitor systemd service health status
+
+USAGE:
+    $PROGNAME [OPTIONS] [SERVICE...]
+
+With no arguments, shows all services in a table. With one or more SERVICE
+names, shows only those services.
+
+OPTIONS:
+    (no option)              Table of all services
+    SERVICE...               Show only the named services
+    --detailed [SERVICE]     Detailed view (all services, or the named one)
+    --alerts                 Show only services with problems/warnings
+    --failed                 Show only failed services with error messages
+    --json                   Machine-readable JSON output
+    --no-colors              Disable ANSI colors (also honours NO_COLOR)
+    --watch [--interval N]   Live monitoring, refresh every N seconds
+    SERVICE --history [--days N]    Restart/state history (default 7 days)
+    SERVICE --logs [--lines N] [--follow]   Journal entries for SERVICE
+    SERVICE --dependencies   Show dependencies and reverse dependencies
+    --config FILE            Load an alternative config file
+    --verbose                Print debug information to stderr
+    --version                Print version and exit
+    --help                   Print this help and exit
+
+EXAMPLES:
+    $PROGNAME
+    $PROGNAME nginx postgresql
+    $PROGNAME --alerts
+    $PROGNAME --json --no-colors
+    $PROGNAME nginx --logs --lines 50
+    $PROGNAME mysql --dependencies
+
+FILES:
+    /etc/service-health/config.conf   Optional configuration
+
+See service-health(1) for full documentation.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+MODE="table"
+declare -a SERVICES=()
+EXIT_CODE=0
+EXPLICIT_CONFIG=""
+
+parse_args() {
+    while (( $# )); do
+        case "$1" in
+            --help|-h)      MODE="help"; return ;;
+            --version|-V)   MODE="version"; return ;;
+            --verbose)      VERBOSE=1 ;;
+            --no-colors|--no-color) NO_COLORS_FLAG=1 ;;
+            --json)         MODE="json" ;;
+            --detailed)     MODE="detailed" ;;
+            --alerts)       MODE="alerts" ;;
+            --failed)       MODE="failed" ;;
+            --watch)        MODE="watch" ;;
+            --history)      MODE="history" ;;
+            --logs)         MODE="logs" ;;
+            --dependencies|--deps) MODE="dependencies" ;;
+            --follow)       FOLLOW=1 ;;
+            --interval)     shift; WATCH_INTERVAL="${1:-2}" ;;
+            --interval=*)   WATCH_INTERVAL="${1#*=}" ;;
+            --days)         shift; HISTORY_DAYS="${1:-7}" ;;
+            --days=*)       HISTORY_DAYS="${1#*=}" ;;
+            --lines)        shift; LOG_LINES="${1:-10}" ;;
+            --lines=*)      LOG_LINES="${1#*=}" ;;
+            --config)       shift; CONFIG_FILE="${1:?--config needs a file}"; EXPLICIT_CONFIG=1 ;;
+            --config=*)     CONFIG_FILE="${1#*=}"; EXPLICIT_CONFIG=1 ;;
+            --)             shift; while (( $# )); do SERVICES+=( "$(normalise_name "$1")" ); shift; done; break ;;
+            -*)             err "Unknown option: $1 (try --help)"; exit 2 ;;
+            *)              SERVICES+=( "$(normalise_name "$1")" ) ;;
+        esac
+        shift
+    done
+
+    # Validate numeric options
+    [[ "$WATCH_INTERVAL" =~ ^[0-9]+$ ]] || { err "--interval must be a number"; exit 2; }
+    [[ "$HISTORY_DAYS"   =~ ^[0-9]+$ ]] || { err "--days must be a number"; exit 2; }
+    [[ "$LOG_LINES"      =~ ^[0-9]+$ ]] || { err "--lines must be a number"; exit 2; }
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+main() {
+    parse_args "$@"
+
+    # Early exits that need neither systemd nor config.
+    case "$MODE" in
+        help)    print_help;    exit 0 ;;
+        version) print_version; exit 0 ;;
+    esac
+
+    load_config "$CONFIG_FILE"
+    setup_colors
+    require_systemd
+
+    case "$MODE" in
+        table)
+            [[ "$DEFAULT_FORMAT" == "json"     ]] && MODE="json"
+            [[ "$DEFAULT_FORMAT" == "detailed" ]] && MODE="detailed"
+            ;;
+    esac
+
+    case "$MODE" in
+        table)
+            collect "${SERVICES[@]}"
+            format_table
+            ;;
+        json)
+            collect "${SERVICES[@]}"
+            format_json
+            ;;
+        alerts)
+            collect "${SERVICES[@]}"
+            format_table 'warning|failed'
+            ;;
+        failed)
+            collect "${SERVICES[@]}"
+            format_table 'failed'
+            # Append error messages for the failed ones.
+            local rec name category _rest
+            for rec in "${COLLECTED[@]}"; do
+                IFS=$'\t' read -r name category _rest <<<"$rec"
+                if [[ "$category" == "failed" ]]; then
+                    local le; le=$(get_last_error "$name")
+                    [[ -n "$le" ]] && printf '%s  %s: %s%s\n' "$C_RED" "${name%.service}" "$le" "$C_RESET"
+                fi
+            done
+            ;;
+        detailed)
+            format_detailed "${SERVICES[@]}"
+            ;;
+        watch)
+            watch_services "${SERVICES[@]}"
+            ;;
+        history)
+            (( ${#SERVICES[@]} )) || { err "--history needs a SERVICE name"; exit 2; }
+            show_history "${SERVICES[0]}"
+            ;;
+        logs)
+            (( ${#SERVICES[@]} )) || { err "--logs needs a SERVICE name"; exit 2; }
+            show_logs "${SERVICES[0]}"
+            ;;
+        dependencies)
+            (( ${#SERVICES[@]} )) || { err "--dependencies needs a SERVICE name"; exit 2; }
+            show_dependencies "${SERVICES[0]}"
+            ;;
+    esac
+
+    exit "$EXIT_CODE"
+}
+
+main "$@"

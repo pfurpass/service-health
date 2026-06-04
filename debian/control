@@ -1,0 +1,32 @@
+Source: service-health
+Section: admin
+Priority: optional
+Maintainer: Phillip Fürpaß <pfurpass@gmail.com>
+Homepage: https://github.com/pfurpass/service-health
+Vcs-Git: https://github.com/pfurpass/service-health.git
+Vcs-Browser: https://github.com/pfurpass/service-health
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Build-Depends: debhelper-compat (= 13)
+
+Package: service-health
+Architecture: all
+Depends: ${misc:Depends},
+         bash (>= 4.0),
+         systemd
+Suggests: jq
+Description: monitor systemd service health status
+ service-health is a command-line tool for monitoring the health of systemd
+ services. It provides a quick overview of all running services with their
+ status, uptime, memory usage, CPU usage and restart counts.
+ .
+ Features:
+  * display all services in a colored table;
+  * JSON output for machine parsing;
+  * live monitoring with --watch;
+  * per-service restart history and journal logs;
+  * dependency and reverse-dependency tracking;
+  * an alert mode that shows only services needing attention.
+ .
+ The tool depends only on bash, systemd and coreutils, requires no network
+ access, and degrades gracefully when run without root privileges.

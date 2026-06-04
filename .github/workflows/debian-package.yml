@@ -1,0 +1,44 @@
+name: build-and-test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  shellcheck-and-bats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck bats groff
+      - name: ShellCheck
+        run: shellcheck -S style service-health
+      - name: Man page lint
+        run: groff -man -Tutf8 -ww -z service-health.1
+      - name: Run tests
+        run: bats tests/test_service_health.bats
+
+  debian-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:bullseye   # Debian 11
+          - debian:bookworm   # Debian 12
+          - debian:trixie     # Debian 13
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential debhelper devscripts lintian bats
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b
+      - name: Run lintian
+        run: lintian ../service-health_*.deb || true
+      - name: Run tests
+        run: bats tests/test_service_health.bats

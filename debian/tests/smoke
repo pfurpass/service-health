@@ -1,0 +1,9 @@
+#!/bin/sh
+# autopkgtest smoke test: run the upstream bats suite against the installed
+# binary. The suite stubs systemctl/ps, so it does not require a booted
+# systemd inside the test environment.
+set -e
+SH_BIN="$(command -v service-health)"
+export SH_BIN
+bats "$AUTOPKGTEST_TMP_SRC/tests/test_service_health.bats" 2>/dev/null \
+    || bats tests/test_service_health.bats

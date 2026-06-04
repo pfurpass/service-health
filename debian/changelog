@@ -1,0 +1,5 @@
+service-health (1.0.0-1) unstable; urgency=medium
+
+  * Initial release for Debian
+
+ -- Phillip Fuerpass <pfurpass@gmail.com>  Thu, 04 Jun 2026 13:58:00 +0000

@@ -1,0 +1,5 @@
+#!/usr/bin/make -f
+# See debhelper(7) and /usr/share/doc/debhelper/examples/rules.tiny
+
+%:
+	dh $@
