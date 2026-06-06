@@ -1,22 +1,7 @@
 # Debian build artifacts
 debian/.debhelper/
-debian/debhelper-build-stamp
+debian/service-health/
 debian/files
+debian/debhelper-build-stamp
 debian/*.substvars
 debian/*.log
-debian/service-health/
-debian/tmp/
-obj-*/
-
-# Build outputs (created in the parent directory)
-*.deb
-*.buildinfo
-*.changes
-*.dsc
-*.tar.gz
-*.tar.xz
-
-# Editor / OS
-*~
-*.swp
-.DS_Store

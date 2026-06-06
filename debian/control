@@ -1,7 +1,7 @@
 Source: service-health
 Section: admin
 Priority: optional
-Maintainer: Phillip Fürpaß <pfurpass@gmail.com>
+Maintainer: Phillip Fuerpass <pfurpass@gmail.com>
 Homepage: https://github.com/pfurpass/service-health
 Vcs-Git: https://github.com/pfurpass/service-health.git
 Vcs-Browser: https://github.com/pfurpass/service-health

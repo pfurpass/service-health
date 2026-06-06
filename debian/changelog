@@ -1,6 +1,5 @@
-service-health (1.0.1) unstable; urgency=medium
+service-health (1.0.1-1) unstable; urgency=medium
 
-  * Initial release for Debian
-  * Native package, fixed lintian issues
+  * Initial release (Closes: #1139002)
 
- -- Phillip Fuerpass <pfurpass@gmail.com>  Thu, 04 Jun 2026 20:00:00 +0000
+ -- Phillip Fuerpass <pfurpass@gmail.com>  Fri, 05 Jun 2026 12:00:00 +0000
