@@ -1,0 +1,4 @@
+version=4
+opts="mode=git, pgpmode=none" \
+  https://github.com/pfurpass/service-health.git \
+  refs/tags/v?(\d[\d.]*) debian uupdate
