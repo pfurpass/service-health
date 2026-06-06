@@ -1,4 +1,0 @@
-version=4
-opts=filenamemangle=s%(?:.*?)?v?(\d[\d.]*)\.tar\.gz%service-health-$1.tar.gz% \
-  https://github.com/pfurpass/service-health/tags \
-  (?:.*?/archive/(?:refs/tags/)?)?v?(\d[\d.]+)\.tar\.gz debian uupdate
