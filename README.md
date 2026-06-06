@@ -122,17 +122,6 @@ groff -man -Tutf8 -ww -z service-health.1
   cells. On terminals that render the variation-selector emoji
   (`⚠️`, `⏸️`) as one cell, a column may shift by one.
 
-## Packaging for Debian
-
-This repository ships a complete `debian/` directory targeting
-`mentors.debian.net`. Before uploading:
-
-1. File an **ITP** ("Intent To Package") bug against `wnpp` and replace the
-   `#XXXXXX` placeholder in `debian/changelog` with the real bug number.
-2. Replace every `Your Name`, `your.email@example.com` and `yourusername`
-   placeholder in `debian/control`, `debian/copyright`, `debian/watch`,
-   `debian/upstream/metadata` and the man page.
-
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
