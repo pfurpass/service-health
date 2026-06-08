@@ -1,0 +1,2 @@
+# GitHub releases are not OpenPGP-signed; the watch file tracks git tags directly.
+unit-health source: debian-watch-does-not-check-openpgp-signature
