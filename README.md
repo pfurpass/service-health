@@ -1,4 +1,4 @@
-# service-health
+# unit-health
 
 A dependency-light command-line tool that reports the health of your
 `systemd` services — status, uptime, memory, CPU, restart count and boot
@@ -30,16 +30,16 @@ custom-api                 ⚠️ warning  2h 30m         500.0MB    47.0%   3  
 ### From a `.deb`
 
 ```sh
-sudo apt install ./service-health_1.0.0-1_all.deb
+sudo apt install ./unit-health_1.0.0-1_all.deb
 ```
 
 ### From source
 
 ```sh
-sudo install -m 0755 service-health /usr/bin/service-health
-sudo install -m 0644 service-health.1 /usr/share/man/man1/service-health.1
-sudo mkdir -p /etc/service-health
-sudo install -m 0644 config.conf /etc/service-health/config.conf
+sudo install -m 0755 unit-health /usr/bin/unit-health
+sudo install -m 0644 unit-health.1 /usr/share/man/man1/unit-health.1
+sudo mkdir -p /etc/unit-health
+sudo install -m 0644 config.conf /etc/unit-health/config.conf
 ```
 
 ### Build the Debian package
@@ -47,23 +47,23 @@ sudo install -m 0644 config.conf /etc/service-health/config.conf
 ```sh
 sudo apt install build-essential debhelper devscripts lintian
 dpkg-buildpackage -us -uc -b
-lintian ../service-health_*.deb
+lintian ../unit-health_*.deb
 ```
 
 ## Usage
 
 ```sh
-service-health                      # table of all services
-service-health nginx postgresql     # only these services
-service-health --alerts             # only problems / warnings
-service-health --failed             # only failed units, with last error
-service-health --json --no-colors   # machine-readable output
-service-health --watch --interval 5 # live view, refresh every 5s
-service-health nginx --logs --lines 50
-service-health nginx --history --days 14
-service-health mysql --dependencies
-service-health --detailed nginx
-service-health --help
+unit-health                      # table of all services
+unit-health nginx postgresql     # only these services
+unit-health --alerts             # only problems / warnings
+unit-health --failed             # only failed units, with last error
+unit-health --json --no-colors   # machine-readable output
+unit-health --watch --interval 5 # live view, refresh every 5s
+unit-health nginx --logs --lines 50
+unit-health nginx --history --days 14
+unit-health mysql --dependencies
+unit-health --detailed nginx
+unit-health --help
 ```
 
 ### JSON fields
@@ -74,7 +74,7 @@ values are `null`.
 
 ## Configuration
 
-`service-health` sources `/etc/service-health/config.conf` if present (or the
+`unit-health` sources `/etc/unit-health/config.conf` if present (or the
 file given with `--config`). See [`config.conf`](config.conf) for all
 settings: `IGNORE_SERVICES`, `CPU_ALERT_THRESHOLD`, `MEMORY_ALERT_THRESHOLD`,
 `RESTART_ALERT_THRESHOLD`, `USE_COLORS`, `DEFAULT_FORMAT`, `WATCH_INTERVAL`.
@@ -102,8 +102,8 @@ bats tests/test_service_health.bats
 Lint the script and the man page:
 
 ```sh
-shellcheck service-health
-groff -man -Tutf8 -ww -z service-health.1
+shellcheck unit-health
+groff -man -Tutf8 -ww -z unit-health.1
 ```
 
 ### Design notes / deliberate choices

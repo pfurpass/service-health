@@ -1,22 +1,22 @@
-Source: service-health
+Source: unit-health
 Section: admin
 Priority: optional
 Maintainer: Phillip Fuerpass <pfurpass@gmail.com>
-Homepage: https://github.com/pfurpass/service-health
-Vcs-Git: https://github.com/pfurpass/service-health.git
-Vcs-Browser: https://github.com/pfurpass/service-health
+Homepage: https://github.com/pfurpass/unit-health
+Vcs-Git: https://github.com/pfurpass/unit-health.git
+Vcs-Browser: https://github.com/pfurpass/unit-health
 Standards-Version: 4.7.4
 Rules-Requires-Root: no
 Build-Depends: debhelper-compat (= 13)
 
-Package: service-health
+Package: unit-health
 Architecture: all
 Depends: ${misc:Depends},
          bash (>= 4.0),
          systemd
 Suggests: jq
 Description: monitor systemd service health status
- service-health is a command-line tool for monitoring the health of systemd
+ unit-health is a command-line tool for monitoring the health of systemd
  services. It provides a quick overview of all running services with their
  status, uptime, memory usage, CPU usage and restart counts.
  .

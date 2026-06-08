@@ -1,2 +1,2 @@
-service-health usr/bin/
-config.conf    etc/service-health/
+unit-health usr/bin/
+config.conf    etc/unit-health/

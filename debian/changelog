@@ -1,4 +1,4 @@
-service-health (1.0.1-1) unstable; urgency=medium
+unit-health (1.0.1-1) unstable; urgency=medium
 
   * Initial release (Closes: #1139002)
 

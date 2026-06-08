@@ -1,15 +1,15 @@
 #!/usr/bin/env bats
 #
-# Test suite for service-health.
+# Test suite for unit-health.
 #
 # The tests stub out `systemctl` and `ps` so they run on any machine,
 # including CI runners and build environments without a booted systemd.
 #
 # Run from the project root with:   bats tests/test_service_health.bats
-# Override the binary under test with:   SH_BIN=/usr/bin/service-health bats ...
+# Override the binary under test with:   SH_BIN=/usr/bin/unit-health bats ...
 
 setup() {
-    : "${SH_BIN:=$BATS_TEST_DIRNAME/../service-health}"
+    : "${SH_BIN:=$BATS_TEST_DIRNAME/../unit-health}"
     MOCKBIN="$BATS_TEST_TMPDIR/bin"
     mkdir -p "$MOCKBIN"
 
@@ -84,7 +84,7 @@ MOCK
 @test "--version prints the version" {
     run "$SH_BIN" --version
     [ "$status" -eq 0 ]
-    [[ "$output" == *"service-health 1.0.0"* ]]
+    [[ "$output" == *"unit-health 1.0.0"* ]]
 }
 
 @test "--help prints usage and exits 0" {

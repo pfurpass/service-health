@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: service-health
+Upstream-Name: unit-health
 Upstream-Contact: Phillip Fürpaß <pfurpass@gmail.com>
-Source: https://github.com/pfurpass/service-health
+Source: https://github.com/pfurpass/unit-health
 
 Files: *
 Copyright: 2026 Phillip Fürpaß <pfurpass@gmail.com>
